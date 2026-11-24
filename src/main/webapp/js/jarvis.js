@@ -23,6 +23,7 @@
 
     var STATE_TEXT = {
         idle: '대기 중',
+        wake: '호출됨',
         listening: '듣는 중',
         thinking: '생각 중',
         speaking: '말하는 중',
@@ -36,6 +37,7 @@
         stateLabel.textContent = STATE_TEXT[state] || state;
         micBtn.classList.toggle('active', state === 'listening');
         micBtn.setAttribute('aria-label', state === 'listening' ? '말하기 멈추기' : '말하기 시작');
+        onStateForClap(state);
     }
 
     function toast(msg, type) {
@@ -328,7 +330,7 @@
             var text = finalText.trim();
             if (text) {
                 send(text);
-            } else if (core.getAttribute('data-state') === 'listening') {
+            } else if (core.getAttribute('data-state') === 'listening' || core.getAttribute('data-state') === 'wake') {
                 setState('idle');
                 if (transcript.textContent === '듣고 있어요...') transcript.textContent = IDLE_TEXT;
             }
@@ -357,6 +359,242 @@
         }
         if (e.key === 'Escape') stopAudio();
     });
+
+    // ---------- 호출: 동작(웹캠 제스처) / 소리(박수 소리) + 제스처 → 기능 연결 ----------
+    //  새 제스처에 기능을 붙이려면 여기에 id: function(detail){...} 를 추가 (id는 gestures.js 참고)
+    var GESTURE_ACTIONS = {
+        double_clap: function () { if (triggerUses('motion')) summon('motion'); },
+        wave: function () { cancelAll('👋 손 흔들기 — 취소했어요'); },
+        open_palm: function () { if (audio || (window.speechSynthesis && speechSynthesis.speaking)) cancelAll('✋ 손바닥 — 멈췄어요'); },
+        thumbs_up: function () { toast('👍 엄지척 인식!', 'ok'); },
+        v_sign: function () { toast('✌️ 브이 인식!', 'ok'); }
+    };
+
+    var clap = null;
+    var sensing = false;
+    var vision = { running: false, present: false };
+    var triggerMode = $('triggerMode');
+    var needPerson = $('needPerson');
+    var clapStatus = $('clapStatus');
+    var resumeTimer = 0;
+    var SENSE_KEY = 'jebris.sense';
+    var TRIGGER_KEY = 'jebris.trigger';
+
+    try { var savedMode = localStorage.getItem(TRIGGER_KEY); if (savedMode) triggerMode.value = savedMode; } catch (e) { /* 무시 */ }
+    function triggerUses(kind) { return triggerMode.value === 'both' || triggerMode.value === kind; }
+
+    var flashUntil = 0;
+    function setClapStatus(text, flash) {
+        if (!flash && Date.now() < flashUntil) return;   // 방금 띄운 알림은 잠시 유지
+        clapStatus.textContent = text;
+        if (flash) {
+            flashUntil = Date.now() + 2500;
+            clapStatus.classList.remove('flash');
+            void clapStatus.offsetWidth; // 애니메이션 다시 시작
+            clapStatus.classList.add('flash');
+        }
+    }
+    function idleStatus() {
+        return { motion: '박수 동작 기다리는 중', sound: '박수 소리 기다리는 중', both: '박수 동작·소리 기다리는 중' }[triggerMode.value];
+    }
+    function syncSoundUi() {
+        $('soundRow').hidden = !triggerUses('sound');
+        $('needPersonWrap').hidden = !triggerUses('sound');
+    }
+
+    // 자비스가 듣거나 말하는 동안은 박수 소리 감지를 멈춘다 (자기 목소리에 반응하지 않게)
+    function onStateForClap(state) {
+        clearTimeout(resumeTimer);
+        if (state === 'idle' || state === 'error') {
+            resumeTimer = setTimeout(function () {
+                if (core.getAttribute('data-state') !== 'idle') return;
+                if (clap && triggerUses('sound')) clap.resume();
+                if (sensing) setClapStatus(idleStatus());
+            }, 900);
+        } else if (clap) {
+            clap.pause();
+        }
+    }
+
+    function sayShort(text, done) {
+        var finished = false;
+        function finish() { if (!finished) { finished = true; done(); } }
+        if (!voiceToggle.checked || !window.speechSynthesis) { setTimeout(finish, 500); return; }
+        try {
+            speechSynthesis.cancel();
+            var u = new SpeechSynthesisUtterance(text);
+            u.lang = 'ko-KR';
+            u.rate = 1.05;
+            var ko = speechSynthesis.getVoices().filter(function (v) { return /ko/i.test(v.lang); });
+            if (ko.length) u.voice = ko[0];
+            u.onend = finish;
+            u.onerror = finish;
+            speechSynthesis.speak(u);
+            setTimeout(finish, 3500); // onend가 안 오는 브라우저 대비
+        } catch (e) {
+            finish();
+        }
+    }
+
+    function cancelAll(msg) {
+        var state = core.getAttribute('data-state');
+        if (state === 'idle' && !audio) return;
+        if (window.speechSynthesis) speechSynthesis.cancel();
+        stopAudio();
+        if (recognition && (listening || state === 'wake')) { try { recognition.abort(); } catch (e) { /* 무시 */ } }
+        if (!busy) setState('idle');
+        transcript.textContent = IDLE_TEXT;
+        setClapStatus(msg, true);
+    }
+
+    function summon(source) {
+        var state = core.getAttribute('data-state');
+        if (state === 'speaking') { stopAudio(); state = core.getAttribute('data-state'); } // 말하는 중에 부르면 끊고 다시 듣기
+        if (busy || listening || (state !== 'idle' && state !== 'error')) return;
+        if (source === 'sound' && needPerson.checked && vision.running && !vision.present) {
+            setClapStatus('짝·짝 소리 — 사람이 안 보여서 무시했어요', true);
+            return;
+        }
+        if (!recognition) {
+            toast('이 브라우저는 음성 인식을 지원하지 않아요. 크롬에서 열어 주세요.', 'error');
+            return;
+        }
+        setClapStatus(source === 'motion' ? '👏 박수 동작 감지! 듣는 중' : '👏 박수 소리 감지! 듣는 중', true);
+        setState('wake');
+        transcript.textContent = '네, 부르셨어요?';
+        sayShort('네, 부르셨어요?', function () {
+            if (core.getAttribute('data-state') !== 'wake') return;
+            try { recognition.start(); } catch (e) { setState('idle'); return; }
+            // 음성 인식이 시작되지 않으면(권한 거부 등) 호출 상태에 멈춰 있지 않게 되돌린다
+            setTimeout(function () {
+                if (core.getAttribute('data-state') === 'wake') {
+                    setState('idle');
+                    transcript.textContent = IDLE_TEXT;
+                }
+            }, 5000);
+        });
+    }
+
+    function startSound() {
+        if (clap) return;
+        clap = new JebrisClap({
+            onDouble: function () { summon('sound'); },
+            onClap: function () { $('visionPanel').classList.add('clap-hit'); setTimeout(function () { $('visionPanel').classList.remove('clap-hit'); }, 160); },
+            onLevel: function (level, threshold) {
+                $('clapLevel').style.width = (level * 100).toFixed(1) + '%';
+                $('clapThresh').style.left = (threshold * 100).toFixed(1) + '%';
+            }
+        });
+        clap.start().then(function () {
+            if (!triggerUses('sound')) clap.pause();
+            onStateForClap(core.getAttribute('data-state'));
+        }).catch(function () {
+            clap = null;
+            setClapStatus('마이크를 쓸 수 없어요');
+            toast('마이크 권한을 허용해야 박수 소리로 부를 수 있어요.', 'error');
+        });
+    }
+
+    function startSensing() {
+        if (sensing) return;
+        sensing = true;
+        $('senseBtn').disabled = true;
+        $('senseBtn').textContent = '켜는 중…';
+        try { localStorage.setItem(SENSE_KEY, '1'); } catch (e) { /* 무시 */ }
+        setClapStatus(idleStatus());
+
+        if (triggerUses('sound')) startSound();
+
+        whenVisionReady(function () {
+            window.JebrisVision.start().then(function () {
+                $('camCover').hidden = true;
+                $('camLive').hidden = false;
+            }).catch(function (e) {
+                console.error(e);
+                $('camCover').hidden = false;
+                $('senseBtn').hidden = true;
+                $('camCover').querySelector('p').textContent = (e && e.name === 'NotAllowedError')
+                    ? '카메라 권한이 거부됐어요. 주소창 왼쪽 아이콘에서 허용해 주세요.'
+                    : '카메라 또는 AI 모델을 불러오지 못했어요. (인터넷 연결 확인)';
+                vision.running = false;
+            });
+        });
+    }
+
+    function whenVisionReady(fn) {
+        if (window.JebrisVision) fn();
+        else window.addEventListener('jebris:vision-ready', fn, { once: true });
+    }
+
+    // 웹캠 상태 → 패널
+    window.addEventListener('jebris:vision', function (e) {
+        var d = e.detail;
+        vision.running = d.running;
+        vision.present = d.present;
+        $('actName').textContent = (d.emoji ? d.emoji + ' ' : '') + d.activity;
+        $('actConf').textContent = d.present ? Math.round(d.confidence * 100) + '%' : '--';
+        $('actBar').style.width = (d.present ? d.confidence * 100 : 0) + '%';
+        $('handCount').textContent = d.running ? '손 ' + d.hands + '개 · 몸 33점 + 손 21점×' + d.hands : '';
+        core.setAttribute('data-present', d.present ? 'true' : 'false');
+        document.body.classList.toggle('person-present', !!d.present);
+    });
+
+    // 제스처 이벤트 → 기록 칩 + 기능 실행
+    window.addEventListener('jebris:gesture', function (e) {
+        var d = e.detail;
+        var logEl = $('gestureLog');
+        var chip = document.createElement('span');
+        chip.className = 'g-chip';
+        chip.textContent = (d.emoji ? d.emoji + ' ' : '') + d.label;
+        logEl.insertBefore(chip, logEl.firstChild);
+        while (logEl.children.length > 4) logEl.removeChild(logEl.lastChild);
+        if (d.id === 'double_clap') {
+            $('visionPanel').classList.add('clap-hit');
+            setTimeout(function () { $('visionPanel').classList.remove('clap-hit'); }, 300);
+        }
+        var action = GESTURE_ACTIONS[d.id];
+        if (action) action(d);
+    });
+
+    triggerMode.addEventListener('change', function () {
+        try { localStorage.setItem(TRIGGER_KEY, triggerMode.value); } catch (e) { /* 무시 */ }
+        syncSoundUi();
+        if (!sensing) return;
+        if (triggerUses('sound')) { if (clap) clap.resume(); else startSound(); }
+        else if (clap) clap.pause();
+        setClapStatus(idleStatus());
+    });
+    syncSoundUi();
+
+    $('senseBtn').addEventListener('click', startSensing);
+
+    // 판정 수치 보기 — 박수·흔들기가 왜 안 잡히는지 눈으로 확인하는 용도
+    var debugTimer = 0;
+    function renderDebug() {
+        var g = window.JebrisGestures, cfg = g && g.config;
+        if (!g) return;
+        var d = g.debug;
+        var dist = d.handDist === null || d.handDist === undefined ? '--' : d.handDist.toFixed(2);
+        $('gDebug').innerHTML =
+            '<span>FPS <b>' + d.fps + '</b>' + (d.fps && d.fps < 10 ? ' ⚠️' : '') + '</span>' +
+            '<span>손 거리 <b>' + dist + '</b> <i>(박수: ' + cfg.clap.maxClosed + ' 이하로 빠르게)</i></span>' +
+            '<span>박수 <b>' + d.clapCount + '</b>/2</span>' +
+            '<span>흔들기 <b>' + d.waveRev + '</b>/' + cfg.wave.reversals + '</span>';
+    }
+    $('debugToggle').addEventListener('change', function () {
+        $('gDebug').hidden = !this.checked;
+        clearInterval(debugTimer);
+        if (this.checked) { renderDebug(); debugTimer = setInterval(renderDebug, 150); }
+    });
+
+    // 전에 켜 둔 적이 있으면, 화면을 처음 클릭할 때 자동으로 다시 켠다
+    // (브라우저는 사용자 클릭 없이 마이크 소리 분석을 시작하지 못하게 막는다)
+    try {
+        if (localStorage.getItem(SENSE_KEY) === '1') {
+            $('senseBtn').textContent = '화면을 클릭하면 켜져요';
+            document.addEventListener('pointerdown', startSensing, { once: true });
+        }
+    } catch (e) { /* 무시 */ }
 
     // 시작
     setState('idle');
